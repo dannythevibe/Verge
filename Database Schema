@@ -1,0 +1,367 @@
+-- Verge Cloud - PostgreSQL Database Schema
+-- Migration: Initial Schema v1.0
+
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================
+-- USERS & AUTHENTICATION
+-- ============================================
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    full_name VARCHAR(255) NOT NULL,
+    cognito_sub VARCHAR(255) UNIQUE NOT NULL,
+    avatar_url TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT TRUE,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_cognito_sub ON users(cognito_sub);
+
+-- ============================================
+-- WORKSPACES & ORGANIZATIONS
+-- ============================================
+
+CREATE TABLE workspaces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) UNIQUE NOT NULL,
+    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_type VARCHAR(50) NOT NULL DEFAULT 'free', -- free, students, teams, enterprise
+    plan_status VARCHAR(50) NOT NULL DEFAULT 'active', -- active, suspended, cancelled
+    storage_used_bytes BIGINT DEFAULT 0,
+    storage_limit_bytes BIGINT DEFAULT 5368709120, -- 5GB default
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    settings JSONB DEFAULT '{}'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_workspaces_owner ON workspaces(owner_id);
+CREATE INDEX idx_workspaces_slug ON workspaces(slug);
+
+CREATE TABLE workspace_members (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL DEFAULT 'member', -- owner, admin, member, viewer
+    invited_by UUID REFERENCES users(id),
+    joined_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    permissions JSONB DEFAULT '{}'::jsonb,
+    UNIQUE(workspace_id, user_id)
+);
+
+CREATE INDEX idx_workspace_members_workspace ON workspace_members(workspace_id);
+CREATE INDEX idx_workspace_members_user ON workspace_members(user_id);
+
+-- ============================================
+-- AI MODEL REGISTRY
+-- ============================================
+
+CREATE TABLE ai_models (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(100) NOT NULL, -- bytez, nano_banana, claude, openai
+    model_name VARCHAR(255) NOT NULL,
+    model_id VARCHAR(255) NOT NULL UNIQUE,
+    model_type VARCHAR(50) NOT NULL, -- text, image, video, audio, code
+    is_free BOOLEAN DEFAULT FALSE,
+    cost_per_1k_tokens DECIMAL(10, 6),
+    cost_per_image DECIMAL(10, 6),
+    cost_per_minute_video DECIMAL(10, 6),
+    max_tokens INTEGER,
+    supports_streaming BOOLEAN DEFAULT FALSE,
+    api_endpoint TEXT NOT NULL,
+    status VARCHAR(50) DEFAULT 'active', -- active, deprecated, disabled
+    quality_score DECIMAL(3, 2) DEFAULT 0.5, -- 0.0 to 1.0
+    speed_score DECIMAL(3, 2) DEFAULT 0.5,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_ai_models_provider ON ai_models(provider);
+CREATE INDEX idx_ai_models_type ON ai_models(model_type);
+CREATE INDEX idx_ai_models_free ON ai_models(is_free);
+
+-- ============================================
+-- MODEL CALLS & PROVENANCE
+-- ============================================
+
+CREATE TABLE model_calls (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    model_id UUID NOT NULL REFERENCES ai_models(id),
+    request_type VARCHAR(50) NOT NULL, -- text, image_gen, video_gen, code_gen
+    prompt_text TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    total_tokens INTEGER,
+    input_files JSONB DEFAULT '[]'::jsonb,
+    output_files JSONB DEFAULT '[]'::jsonb,
+    provider_cost DECIMAL(10, 6) DEFAULT 0,
+    verge_cost DECIMAL(10, 6) DEFAULT 0,
+    latency_ms INTEGER,
+    status VARCHAR(50) DEFAULT 'pending', -- pending, processing, completed, failed
+    error_message TEXT,
+    safety_flags JSONB DEFAULT '[]'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_model_calls_workspace ON model_calls(workspace_id);
+CREATE INDEX idx_model_calls_user ON model_calls(user_id);
+CREATE INDEX idx_model_calls_model ON model_calls(model_id);
+CREATE INDEX idx_model_calls_created_at ON model_calls(created_at);
+CREATE INDEX idx_model_calls_status ON model_calls(status);
+
+-- ============================================
+-- BILLING & PAYMENTS
+-- ============================================
+
+CREATE TABLE billing_accounts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE UNIQUE,
+    stripe_customer_id VARCHAR(255),
+    paystack_customer_id VARCHAR(255),
+    payment_method VARCHAR(50), -- stripe, paystack
+    balance_cents INTEGER DEFAULT 0,
+    credit_cents INTEGER DEFAULT 0,
+    currency VARCHAR(3) DEFAULT 'USD',
+    billing_email VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_billing_accounts_workspace ON billing_accounts(workspace_id);
+
+CREATE TABLE invoices (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    invoice_number VARCHAR(50) UNIQUE NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    status VARCHAR(50) DEFAULT 'draft', -- draft, sent, paid, overdue, cancelled
+    due_date DATE,
+    paid_at TIMESTAMP WITH TIME ZONE,
+    stripe_invoice_id VARCHAR(255),
+    paystack_reference VARCHAR(255),
+    line_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_invoices_workspace ON invoices(workspace_id);
+CREATE INDEX idx_invoices_status ON invoices(status);
+CREATE INDEX idx_invoices_due_date ON invoices(due_date);
+
+CREATE TABLE transactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    invoice_id UUID REFERENCES invoices(id),
+    amount_cents INTEGER NOT NULL,
+    currency VARCHAR(3) DEFAULT 'USD',
+    type VARCHAR(50) NOT NULL, -- charge, refund, credit, model_usage
+    status VARCHAR(50) DEFAULT 'pending', -- pending, completed, failed
+    description TEXT,
+    stripe_transaction_id VARCHAR(255),
+    paystack_reference VARCHAR(255),
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_transactions_workspace ON transactions(workspace_id);
+CREATE INDEX idx_transactions_type ON transactions(type);
+CREATE INDEX idx_transactions_created_at ON transactions(created_at);
+
+-- ============================================
+-- ORG WORKSPACE (Docs, Finance, Legal, CRM)
+-- ============================================
+
+CREATE TABLE documents (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    created_by UUID NOT NULL REFERENCES users(id),
+    title VARCHAR(500) NOT NULL,
+    content TEXT,
+    doc_type VARCHAR(50) DEFAULT 'document', -- document, spreadsheet, presentation
+    parent_id UUID REFERENCES documents(id) ON DELETE CASCADE,
+    is_folder BOOLEAN DEFAULT FALSE,
+    version INTEGER DEFAULT 1,
+    status VARCHAR(50) DEFAULT 'draft', -- draft, published, archived
+    permissions JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_documents_workspace ON documents(workspace_id);
+CREATE INDEX idx_documents_parent ON documents(parent_id);
+
+CREATE TABLE crm_contacts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    email VARCHAR(255),
+    phone VARCHAR(50),
+    company VARCHAR(255),
+    full_name VARCHAR(255) NOT NULL,
+    status VARCHAR(50) DEFAULT 'lead', -- lead, prospect, customer, inactive
+    tags JSONB DEFAULT '[]'::jsonb,
+    custom_fields JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_crm_contacts_workspace ON crm_contacts(workspace_id);
+CREATE INDEX idx_crm_contacts_email ON crm_contacts(email);
+
+-- ============================================
+-- DEV MODE (Projects, Deployments, CI/CD)
+-- ============================================
+
+CREATE TABLE dev_projects (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    framework VARCHAR(100), -- react, nextjs, vue, express, fastapi
+    repository_url TEXT,
+    default_branch VARCHAR(100) DEFAULT 'main',
+    auto_deploy BOOLEAN DEFAULT FALSE,
+    env_vars JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_dev_projects_workspace ON dev_projects(workspace_id);
+
+CREATE TABLE deployments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES dev_projects(id) ON DELETE CASCADE,
+    environment VARCHAR(50) NOT NULL, -- staging, production
+    commit_sha VARCHAR(40),
+    status VARCHAR(50) DEFAULT 'pending', -- pending, building, deploying, live, failed
+    build_logs TEXT,
+    deployment_url TEXT,
+    deployed_by UUID REFERENCES users(id),
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_deployments_project ON deployments(project_id);
+CREATE INDEX idx_deployments_status ON deployments(status);
+
+-- ============================================
+-- MARKETING SPACE (Campaigns, Assets)
+-- ============================================
+
+CREATE TABLE marketing_campaigns (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    campaign_type VARCHAR(50), -- email, social, ads, content
+    status VARCHAR(50) DEFAULT 'draft', -- draft, scheduled, active, completed, paused
+    target_audience JSONB DEFAULT '{}'::jsonb,
+    assets JSONB DEFAULT '[]'::jsonb,
+    metrics JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_marketing_campaigns_workspace ON marketing_campaigns(workspace_id);
+
+CREATE TABLE media_assets (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    uploaded_by UUID NOT NULL REFERENCES users(id),
+    file_name VARCHAR(500) NOT NULL,
+    file_type VARCHAR(50), -- image, video, audio
+    s3_key TEXT NOT NULL,
+    s3_bucket VARCHAR(255) NOT NULL,
+    file_size_bytes BIGINT,
+    cdn_url TEXT,
+    thumbnail_url TEXT,
+    duration_seconds INTEGER,
+    dimensions JSONB,
+    tags JSONB DEFAULT '[]'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_media_assets_workspace ON media_assets(workspace_id);
+CREATE INDEX idx_media_assets_type ON media_assets(file_type);
+
+-- ============================================
+-- AUDIT LOG
+-- ============================================
+
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    action VARCHAR(100) NOT NULL,
+    resource_type VARCHAR(100),
+    resource_id UUID,
+    ip_address INET,
+    user_agent TEXT,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_audit_logs_workspace ON audit_logs(workspace_id);
+CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
+CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
+
+-- ============================================
+-- TRIGGERS FOR UPDATED_AT
+-- ============================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_workspaces_updated_at BEFORE UPDATE ON workspaces
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_ai_models_updated_at BEFORE UPDATE ON ai_models
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_documents_updated_at BEFORE UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================
+-- SEED DATA (AI Models Registry)
+-- ============================================
+
+-- Bytez Free Models
+INSERT INTO ai_models (provider, model_name, model_id, model_type, is_free, api_endpoint, quality_score, speed_score) VALUES
+('bytez', 'Bytez GPT-Free', 'bytez-gpt-free', 'text', TRUE, 'https://api.bytez.com/v1/text', 0.7, 0.8),
+('bytez', 'Bytez Vision-Free', 'bytez-vision-free', 'image', TRUE, 'https://api.bytez.com/v1/vision', 0.6, 0.7);
+
+-- Bytez Paid Models
+INSERT INTO ai_models (provider, model_name, model_id, model_type, is_free, cost_per_1k_tokens, api_endpoint, quality_score, speed_score) VALUES
+('bytez', 'Bytez GPT-Pro', 'bytez-gpt-pro', 'text', FALSE, 0.002, 'https://api.bytez.com/v1/text/pro', 0.9, 0.85),
+('bytez', 'Bytez Image-Pro', 'bytez-image-pro', 'image', FALSE, 0.05, 'https://api.bytez.com/v1/image/pro', 0.95, 0.8);
+
+-- Nano Banana Models
+INSERT INTO ai_models (provider, model_name, model_id, model_type, is_free, cost_per_1k_tokens, api_endpoint, quality_score, speed_score) VALUES
+('nano_banana', 'Nano Code-Assist', 'nano-code-assist', 'code', FALSE, 0.003, 'https://api.nanobanana.ai/code', 0.88, 0.9);
+
+-- Claude Models
+INSERT INTO ai_models (provider, model_name, model_id, model_type, is_free, cost_per_1k_tokens, api_endpoint, quality_score, speed_score) VALUES
+('anthropic', 'Claude 3.5 Sonnet', 'claude-3-5-sonnet', 'text', FALSE, 0.015, 'https://api.anthropic.com/v1/messages', 0.98, 0.85);
+
+COMMENT ON DATABASE verge IS 'Verge Cloud - Unified AI Orchestration Platform by Obsidian Studios';
