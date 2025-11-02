@@ -219,4 +219,13 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
-
+# Verge specific (custom additions)
+.verge/
+artifacts/
+logs/
+cache/
+tmp/
+__orchestrator_temp__/
+uploads/
+models/
+data/
