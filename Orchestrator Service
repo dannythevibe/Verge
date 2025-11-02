@@ -1,0 +1,442 @@
+// Verge Cloud - Orchestrator Service
+// Core AI routing and orchestration logic
+
+import express, { Request, Response } from 'express';
+import { Pool } from 'pg';
+import AWS from 'aws-sdk';
+import Anthropic from '@anthropic-ai/sdk';
+import axios from 'axios';
+
+// ============================================
+// CONFIGURATION
+// ============================================
+
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+
+const PORT = process.env.PORT || 3000;
+
+const db = new Pool({
+  host: process.env.DB_HOST,
+  port: parseInt(process.env.DB_PORT || '5432'),
+  database: process.env.DB_NAME || 'verge',
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  ssl: { rejectUnauthorized: false }
+});
+
+const s3 = new AWS.S3({ region: process.env.AWS_REGION || 'us-east-1' });
+const sqs = new AWS.SQS({ region: process.env.AWS_REGION || 'us-east-1' });
+
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY!
+});
+
+// ============================================
+// TYPES & INTERFACES
+// ============================================
+
+interface ModelRequest {
+  workspace_id: string;
+  user_id: string;
+  request_type: 'text' | 'image_gen' | 'video_gen' | 'code_gen';
+  prompt: string;
+  files?: string[];
+  preferences?: {
+    prefer_free?: boolean;
+    max_cost?: number;
+    quality_threshold?: number;
+  };
+}
+
+interface AIModel {
+  id: string;
+  provider: string;
+  model_id: string;
+  model_type: string;
+  is_free: boolean;
+  cost_per_1k_tokens?: number;
+  cost_per_image?: number;
+  api_endpoint: string;
+  quality_score: number;
+  speed_score: number;
+}
+
+interface ModelResponse {
+  call_id: string;
+  output: any;
+  tokens_used?: number;
+  cost: number;
+  latency_ms: number;
+  model_used: string;
+}
+
+// ============================================
+// MODEL SELECTION LOGIC
+// ============================================
+
+class ModelSelector {
+  async selectBestModel(
+    requestType: string,
+    preferences: any = {}
+  ): Promise<AIModel> {
+    const { prefer_free = true, quality_threshold = 0.7, max_cost } = preferences;
+
+    const query = `
+      SELECT * FROM ai_models
+      WHERE model_type = $1
+        AND status = 'active'
+        ${prefer_free ? 'AND is_free = TRUE' : ''}
+        AND quality_score >= $2
+        ${max_cost ? 'AND cost_per_1k_tokens <= $3' : ''}
+      ORDER BY 
+        is_free DESC,
+        quality_score DESC,
+        speed_score DESC
+      LIMIT 1
+    `;
+
+    const params = [requestType, quality_threshold];
+    if (max_cost) params.push(max_cost);
+
+    const result = await db.query(query, params);
+
+    if (result.rows.length === 0) {
+      // Fallback: try paid models if no free model found
+      const fallbackQuery = `
+        SELECT * FROM ai_models
+        WHERE model_type = $1 AND status = 'active'
+        ORDER BY quality_score DESC, cost_per_1k_tokens ASC
+        LIMIT 1
+      `;
+      const fallback = await db.query(fallbackQuery, [requestType]);
+      
+      if (fallback.rows.length === 0) {
+        throw new Error(`No suitable model found for type: ${requestType}`);
+      }
+      
+      return fallback.rows[0];
+    }
+
+    return result.rows[0];
+  }
+}
+
+// ============================================
+// PROMPT OPTIMIZATION (Claude)
+// ============================================
+
+class PromptOptimizer {
+  async optimizePrompt(
+    originalPrompt: string,
+    targetModel: AIModel,
+    context?: any
+  ): Promise<string> {
+    const systemPrompt = `You are a prompt optimization expert. Given a user's prompt and target AI model, rewrite the prompt to maximize quality and minimize cost. Be concise but clear.
+
+Target Model: ${targetModel.model_name} (${targetModel.provider})
+Model Type: ${targetModel.model_type}
+Quality Score: ${targetModel.quality_score}
+
+Rules:
+- Keep prompts under 200 tokens when possible
+- Be specific and actionable
+- Remove ambiguity
+- Add relevant context if needed`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 500,
+      messages: [{
+        role: 'user',
+        content: `Original prompt: ${originalPrompt}\n\nOptimize this prompt:`
+      }],
+      system: systemPrompt
+    });
+
+    const optimized = message.content[0].type === 'text' 
+      ? message.content[0].text 
+      : originalPrompt;
+
+    return optimized;
+  }
+}
+
+// ============================================
+// MODEL EXECUTORS
+// ============================================
+
+class BytezExecutor {
+  async execute(model: AIModel, prompt: string): Promise<any> {
+    const startTime = Date.now();
+    
+    const response = await axios.post(
+      model.api_endpoint,
+      {
+        model: model.model_id,
+        prompt: prompt,
+        max_tokens: model.max_tokens || 2000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.BYTEZ_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const latency = Date.now() - startTime;
+
+    return {
+      output: response.data.choices?.[0]?.text || response.data.output,
+      tokens_used: response.data.usage?.total_tokens || 0,
+      latency_ms: latency
+    };
+  }
+}
+
+class NanoBananaExecutor {
+  async execute(model: AIModel, prompt: string): Promise<any> {
+    const startTime = Date.now();
+    
+    const response = await axios.post(
+      model.api_endpoint,
+      {
+        prompt: prompt,
+        language: 'typescript', // for code models
+        max_length: 1000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${process.env.NANO_BANANA_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const latency = Date.now() - startTime;
+
+    return {
+      output: response.data.code || response.data.output,
+      tokens_used: Math.ceil(response.data.code?.length / 4) || 0,
+      latency_ms: latency
+    };
+  }
+}
+
+class ClaudeExecutor {
+  async execute(model: AIModel, prompt: string): Promise<any> {
+    const startTime = Date.now();
+    
+    const message = await anthropic.messages.create({
+      model: model.model_id,
+      max_tokens: 4000,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const latency = Date.now() - startTime;
+    const output = message.content[0].type === 'text' 
+      ? message.content[0].text 
+      : '';
+
+    return {
+      output,
+      tokens_used: message.usage.input_tokens + message.usage.output_tokens,
+      latency_ms: latency
+    };
+  }
+}
+
+// ============================================
+// ORCHESTRATOR
+// ============================================
+
+class Orchestrator {
+  private selector = new ModelSelector();
+  private optimizer = new PromptOptimizer();
+  private executors = {
+    bytez: new BytezExecutor(),
+    nano_banana: new NanoBananaExecutor(),
+    anthropic: new ClaudeExecutor()
+  };
+
+  async processRequest(request: ModelRequest): Promise<ModelResponse> {
+    const startTime = Date.now();
+
+    // Step 1: Select best model
+    const model = await this.selector.selectBestModel(
+      request.request_type,
+      request.preferences
+    );
+
+    console.log(`Selected model: ${model.model_name} (${model.provider})`);
+
+    // Step 2: Optimize prompt (using Claude)
+    const optimizedPrompt = await this.optimizer.optimizePrompt(
+      request.prompt,
+      model
+    );
+
+    console.log(`Optimized prompt from ${request.prompt.length} to ${optimizedPrompt.length} chars`);
+
+    // Step 3: Execute model call
+    const executor = this.executors[model.provider as keyof typeof this.executors];
+    
+    if (!executor) {
+      throw new Error(`No executor found for provider: ${model.provider}`);
+    }
+
+    const result = await executor.execute(model, optimizedPrompt);
+
+    // Step 4: Calculate costs
+    const providerCost = this.calculateCost(model, result.tokens_used);
+    const vergeCost = providerCost * 1.5; // 50% markup
+
+    // Step 5: Store provenance in database
+    const callRecord = await this.recordModelCall({
+      workspace_id: request.workspace_id,
+      user_id: request.user_id,
+      model_id: model.id,
+      request_type: request.request_type,
+      prompt_text: request.prompt,
+      total_tokens: result.tokens_used,
+      provider_cost: providerCost,
+      verge_cost: vergeCost,
+      latency_ms: result.latency_ms,
+      status: 'completed',
+      output_files: result.output ? [result.output] : []
+    });
+
+    // Step 6: Update billing
+    await this.recordTransaction({
+      workspace_id: request.workspace_id,
+      amount_cents: Math.round(vergeCost * 100),
+      type: 'model_usage',
+      description: `${model.model_name} - ${request.request_type}`,
+      metadata: { call_id: callRecord.id }
+    });
+
+    const totalLatency = Date.now() - startTime;
+
+    return {
+      call_id: callRecord.id,
+      output: result.output,
+      tokens_used: result.tokens_used,
+      cost: vergeCost,
+      latency_ms: totalLatency,
+      model_used: model.model_name
+    };
+  }
+
+  private calculateCost(model: AIModel, tokensUsed: number): number {
+    if (model.is_free) return 0;
+    
+    if (model.cost_per_1k_tokens) {
+      return (tokensUsed / 1000) * model.cost_per_1k_tokens;
+    }
+    
+    if (model.cost_per_image) {
+      return model.cost_per_image;
+    }
+    
+    return 0;
+  }
+
+  private async recordModelCall(data: any) {
+    const query = `
+      INSERT INTO model_calls (
+        workspace_id, user_id, model_id, request_type, 
+        prompt_text, total_tokens, provider_cost, verge_cost,
+        latency_ms, status, output_files
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING id
+    `;
+
+    const result = await db.query(query, [
+      data.workspace_id, data.user_id, data.model_id, data.request_type,
+      data.prompt_text, data.total_tokens, data.provider_cost, data.verge_cost,
+      data.latency_ms, data.status, JSON.stringify(data.output_files)
+    ]);
+
+    return result.rows[0];
+  }
+
+  private async recordTransaction(data: any) {
+    const query = `
+      INSERT INTO transactions (
+        workspace_id, amount_cents, type, description, metadata
+      ) VALUES ($1, $2, $3, $4, $5)
+    `;
+
+    await db.query(query, [
+      data.workspace_id, data.amount_cents, data.type, 
+      data.description, JSON.stringify(data.metadata)
+    ]);
+  }
+}
+
+// ============================================
+// API ROUTES
+// ============================================
+
+const orchestrator = new Orchestrator();
+
+app.post('/api/v1/orchestrate', async (req: Request, res: Response) => {
+  try {
+    const request: ModelRequest = req.body;
+
+    // Validate request
+    if (!request.workspace_id || !request.user_id || !request.prompt) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: workspace_id, user_id, prompt' 
+      });
+    }
+
+    // Process request
+    const response = await orchestrator.processRequest(request);
+
+    res.json({
+      success: true,
+      data: response
+    });
+
+  } catch (error: any) {
+    console.error('Orchestration error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/health', (req: Request, res: Response) => {
+  res.json({ status: 'healthy', service: 'verge-orchestrator' });
+});
+
+app.get('/api/v1/models', async (req: Request, res: Response) => {
+  try {
+    const result = await db.query(`
+      SELECT provider, model_name, model_type, is_free, 
+             quality_score, speed_score
+      FROM ai_models
+      WHERE status = 'active'
+      ORDER BY provider, quality_score DESC
+    `);
+
+    res.json({ models: result.rows });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
+app.listen(PORT, () => {
+  console.log(`🚀 Verge Orchestrator running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`AWS Region: ${process.env.AWS_REGION || 'us-east-1'}`);
+});
+
+export default app;
