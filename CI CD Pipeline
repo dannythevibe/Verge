@@ -20,7 +20,6 @@ env:
   ECS_SERVICE: verge-orchestrator-service
   ECS_CLUSTER: verge-cloud-cluster
   CONTAINER_NAME: verge-orchestrator
-  TERRAFORM_VERSION: 1.6.0
 
 jobs:
   # ============================================
@@ -45,16 +44,6 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
-      
-      redis:
-        image: redis:7.0
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 6379:6379
     
     steps:
       - name: Checkout code
@@ -76,8 +65,6 @@ jobs:
           DB_NAME: verge_test
           DB_USER: verge
           DB_PASSWORD: test_password
-          REDIS_HOST: localhost
-          REDIS_PORT: 6379
         run: |
           npm run db:migrate
       
@@ -94,8 +81,6 @@ jobs:
           DB_NAME: verge_test
           DB_USER: verge
           DB_PASSWORD: test_password
-          REDIS_HOST: localhost
-          REDIS_PORT: 6379
         run: npm run test:integration
       
       - name: Upload coverage reports
@@ -160,84 +145,6 @@ jobs:
             NODE_ENV=production
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
             GIT_SHA=${{ github.sha }}
-  
-  # ============================================
-  # DEPLOY TO DEVELOPMENT
-  # ============================================
-  
-  deploy-development:
-    name: Deploy to Development
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/develop'
-    environment:
-      name: development
-      url: https://dev.verge.cloud
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-      
-      - name: Download task definition
-        run: |
-          aws ecs describe-task-definition \
-            --task-definition verge-orchestrator-dev \
-            --query taskDefinition > task-definition.json
-      
-      - name: Update ECS task definition
-        id: task-def
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition: task-definition.json
-          container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:develop-${{ github.sha }}
-          environment-variables: |
-            NODE_ENV=development
-            AWS_REGION=${{ env.AWS_REGION }}
-            LOG_LEVEL=debug
-      
-      - name: Deploy to ECS
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def.outputs.task-definition }}
-          service: ${{ env.ECS_SERVICE }}-dev
-          cluster: ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
-      
-      - name: Run smoke tests
-        run: |
-          sleep 30
-          curl -f https://dev-api.verge.cloud/health || exit 1
-      
-      - name: Notify Slack
-        uses: slackapi/slack-github-action@v1
-        with:
-          payload: |
-            {
-              "text": "🧪 Verge Cloud deployed to DEVELOPMENT",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Deployment Status:* 🧪 Development Deployment\n*Environment:* Development\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
-                  }
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   
   # ============================================
   # DEPLOY TO STAGING
@@ -363,46 +270,6 @@ jobs:
             AWS_REGION=${{ env.AWS_REGION }}
             LOG_LEVEL=info
       
-      - name: Prepare CodeDeploy AppSpec file
-        run: |
-          cat > appspec.json << EOL
-          {
-            "version": 0.0,
-            "Resources": [
-              {
-                "TargetService": {
-                  "Type": "AWS::ECS::Service",
-                  "Properties": {
-                    "TaskDefinition": "${{ steps.task-def.outputs.task-definition }}",
-                    "LoadBalancerInfo": {
-                      "ContainerName": "${CONTAINER_NAME}",
-                      "ContainerPort": 3000
-                    }
-                  }
-                }
-              }
-            ],
-            "Hooks": [
-              {
-                "BeforeAllowTraffic": "${LAMBDA_BEFORE_ALLOW_TRAFFIC_ARN}"
-              },
-              {
-                "AfterAllowTraffic": "${LAMBDA_AFTER_ALLOW_TRAFFIC_ARN}"
-              }
-            ]
-          }
-          EOL
-          # Replace environment variable placeholders
-          LAMBDA_BEFORE_ALLOW_TRAFFIC_ARN=$(aws ssm get-parameter --name "/verge-cloud/lambda/before-traffic" --query "Parameter.Value" --output text || echo "")
-          LAMBDA_AFTER_ALLOW_TRAFFIC_ARN=$(aws ssm get-parameter --name "/verge-cloud/lambda/after-traffic" --query "Parameter.Value" --output text || echo "")
-          
-          sed -i "s|\${LAMBDA_BEFORE_ALLOW_TRAFFIC_ARN}|$LAMBDA_BEFORE_ALLOW_TRAFFIC_ARN|g" appspec.json
-          sed -i "s|\${LAMBDA_AFTER_ALLOW_TRAFFIC_ARN}|$LAMBDA_AFTER_ALLOW_TRAFFIC_ARN|g" appspec.json
-          sed -i "s|\${CONTAINER_NAME}|$CONTAINER_NAME|g" appspec.json
-          
-          echo "AppSpec file generated:"
-          cat appspec.json
-      
       - name: Deploy to ECS (Blue/Green)
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
@@ -465,75 +332,10 @@ jobs:
   # INFRASTRUCTURE DEPLOY (Terraform)
   # ============================================
   
-  terraform-plan:
-    name: Terraform Plan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'terraform')
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TERRAFORM_VERSION }}
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Terraform Init
-        run: terraform init
-        working-directory: ./infrastructure
-      
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
-        working-directory: ./infrastructure
-      
-      - name: Terraform Validate
-        run: terraform validate
-        working-directory: ./infrastructure
-      
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
-        working-directory: ./infrastructure
-        env:
-          TF_VAR_db_master_password: ${{ secrets.DB_MASTER_PASSWORD }}
-          TF_VAR_environment: ${{ github.head_ref == 'main' && 'prod' || github.head_ref == 'staging' && 'staging' || 'dev' }}
-      
-      - name: Upload Terraform plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: ./infrastructure/tfplan
-      
-      - name: Comment on PR with Terraform plan
-        uses: actions/github-script@v7
-        if: github.event_name == 'pull_request'
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const planOutput = fs.readFileSync('./infrastructure/terraform-plan-output.txt', 'utf8');
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Terraform Plan Output 📋\n\n\`\`\`\n${planOutput}\n\`\`\``
-            })
-
-  terraform-apply:
+  terraform:
     name: Terraform Apply
     runs-on: ubuntu-latest
-    if: |
-      (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[terraform]')) || 
-      (github.ref == 'refs/heads/staging' && contains(github.event.head_commit.message, '[terraform]')) || 
-      (github.ref == 'refs/heads/develop' && contains(github.event.head_commit.message, '[terraform]'))
-    environment: ${{ github.ref == 'refs/heads/main' && 'production' || github.ref == 'refs/heads/staging' && 'staging' || 'development' }}
+    if: github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[terraform]')
     
     steps:
       - name: Checkout code
@@ -542,7 +344,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_version: 1.6.0
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -555,57 +357,15 @@ jobs:
         run: terraform init
         working-directory: ./infrastructure
       
-      - name: Determine environment
-        id: env
-        run: |
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            echo "env_name=prod" >> $GITHUB_OUTPUT
-          elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
-            echo "env_name=staging" >> $GITHUB_OUTPUT
-          else
-            echo "env_name=dev" >> $GITHUB_OUTPUT
-          fi
-      
       - name: Terraform Plan
         run: terraform plan -out=tfplan
         working-directory: ./infrastructure
         env:
           TF_VAR_db_master_password: ${{ secrets.DB_MASTER_PASSWORD }}
-          TF_VAR_environment: ${{ steps.env.outputs.env_name }}
-          TF_VAR_domain_name: ${{ steps.env.outputs.env_name == 'prod' && 'api.verge.cloud' || steps.env.outputs.env_name == 'staging' && 'staging-api.verge.cloud' || 'dev-api.verge.cloud' }}
-          TF_VAR_frontend_domain_name: ${{ steps.env.outputs.env_name == 'prod' && 'verge.cloud' || steps.env.outputs.env_name == 'staging' && 'staging.verge.cloud' || 'dev.verge.cloud' }}
       
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
         working-directory: ./infrastructure
-      
-      - name: Export Terraform outputs
-        id: terraform_outputs
-        run: |
-          echo "vpc_id=$(terraform output -raw vpc_id)" >> $GITHUB_ENV
-          echo "alb_dns_name=$(terraform output -raw alb_dns_name)" >> $GITHUB_ENV
-          echo "cloudfront_domain_name=$(terraform output -raw cloudfront_domain_name)" >> $GITHUB_ENV
-          echo "redis_endpoint=$(terraform output -raw redis_endpoint)" >> $GITHUB_ENV
-        working-directory: ./infrastructure
-      
-      - name: Notify Slack about infrastructure changes
-        uses: slackapi/slack-github-action@v1
-        with:
-          payload: |
-            {
-              "text": "🏗️ Verge Cloud Infrastructure Updated",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "*Infrastructure Update:* 🏗️ Terraform Applied\n*Environment:* ${{ steps.env.outputs.env_name }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}\n*ALB DNS:* ${{ env.alb_dns_name }}\n*CloudFront:* ${{ env.cloudfront_domain_name }}"
-                  }
-                }
-              ]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
   
   # ============================================
   # SECURITY SCANNING
@@ -631,13 +391,6 @@ jobs:
         uses: github/codeql-action/upload-sarif@v2
         with:
           sarif_file: 'trivy-results.sarif'
-      
-      - name: Scan Terraform code for security issues
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory: infrastructure/
-          framework: terraform
-          output_format: github_failed_only
       
       - name: Run npm audit
         run: npm audit --audit-level=high
